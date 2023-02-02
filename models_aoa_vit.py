@@ -60,8 +60,8 @@ class AttentionOnAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-        self.head_proj = nn.Linear(num_heads, num_heads)
-
+        # self.head_proj = nn.Linear(num_heads, num_heads)
+        self.head_proj = nn.Linear(dim // num_heads, 3 * dim // num_heads)
 
     def forward(self, x):
         B, N, C = x.shape
@@ -73,12 +73,13 @@ class AttentionOnAttention(nn.Module):
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn) # (bsz, num_heads, seq_len, seq_len)  -> (bsz, num_heads, seq_len, d_model// num_head)
+        x = (attn @ v).transpose(1, 2) #(bsz, seq_l, num_head, d_model// num_head)  
+        
+        qkvx = self.head_proj(x).reshape(B, N, self.num_heads, 3, C //self.num_heads).permute(3, 0, 1, 2, 4)
+        qx, kx, vx = qkvx.unbind(0)
+        attnx = (qx @ kx.transpose(-2, -1)).softmax(dim=-1) 
+        x = (attnx @ vx).reshape(B, N, -1)
 
-        x = (attn @ v).reshape(B, self.num_heads, -1)
-        attn_head = self.head_proj((x @ x.transpose(-2, -1)))
-        attn_head = attn_head.softmax(dim=-1) 
-        x = (attn_head @ x).reshape(B, self.num_heads, N, -1)
-        x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
