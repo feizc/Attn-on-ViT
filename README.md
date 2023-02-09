@@ -1,2 +1,3 @@
-# AoA-ViT
-Attention on Attention for Vision Transformers
+# Attn-on-ViT
+Analyze different attention patterns for Vision Transformers.
+Based on Timm. 
