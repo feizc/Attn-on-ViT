@@ -13,6 +13,7 @@ from functools import partial
 import math 
 import torch
 import torch.nn as nn
+import numpy as np 
 
 from timm.models.vision_transformer import PatchEmbed, DropPath, Mlp, trunc_normal_, _load_weights, \
                                             named_apply
@@ -48,7 +49,7 @@ class Attention(nn.Module):
 
 
 class BatchMemoryAttention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., alpha=0.2):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., alpha=0.01):
         super().__init__()
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
         self.num_heads = num_heads
@@ -62,19 +63,21 @@ class BatchMemoryAttention(nn.Module):
 
         self.batch_memory_proj_k = nn.Linear(dim // num_heads, dim // num_heads) 
         self.batch_memory_proj_v = nn.Linear(dim // num_heads, dim // num_heads) 
-        self.mean_key = torch.zeros((1, 196, 3, 8, 64)) 
-        self.mean_value = torch.zeros((1, 196, 3, 8, 64)) 
-        self.alpha = alpha
+        self.mean_key = torch.zeros((num_heads, 197, dim // num_heads)) 
+        self.mean_value = torch.zeros((num_heads, 197, dim // num_heads)) 
+        self.alpha = alpha 
+
+        self.scale = nn.Parameter(torch.ones([]))
 
 
     def forward(self, x):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)   # make torchscript happy (cannot use tensor as tuple)
-
+        
         # moving average 
-        self.mean_key = self.alpha * k + (1 - self.alpha) * self.mean_key 
-        self.mean_value = self.alpha * v + (1 - self.alpha) * self.mean_value 
+        self.mean_key = self.alpha * torch.mean(k, dim=0) + (1 - self.alpha) * self.mean_key.to(x.device) 
+        self.mean_value = self.alpha * torch.mean(v, dim=0) + (1 - self.alpha) * self.mean_value.to(x.device)
 
         delta_k = self.mean_key.detach()
         delta_v = self.mean_value.detach() 
@@ -82,8 +85,8 @@ class BatchMemoryAttention(nn.Module):
         delta_k = self.batch_memory_proj_k(delta_k) 
         delta_v = self.batch_memory_proj_v(delta_v) 
 
-        k = k + delta_k 
-        v = v + delta_v
+        k = k + self.scale * delta_k 
+        v = v + self.scale * delta_v
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
@@ -122,7 +125,7 @@ class Block(nn.Module):
     ):
         super().__init__()
         self.norm1 = norm_layer(dim)
-        self.attn = AttentionOnAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
+        self.attn = BatchMemoryAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
         self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
@@ -138,7 +141,7 @@ class Block(nn.Module):
         return x
 
 
-class AttenOnAttenVisionTransformer(nn.Module):
+class AttenBatchVisionTransformer(nn.Module):
     """ Vision Transformer
     A PyTorch impl of : `An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale`
         - https://arxiv.org/abs/2010.11929
@@ -333,22 +336,22 @@ def init_weights_vit_timm(module: nn.Module, name: str = ''):
         module.init_weights()
 
 
-def ba_vit_base_patch16(**kwargs):
-    model = AttenOnAttenVisionTransformer(
+def vit_base_patch16(**kwargs):
+    model = AttenBatchVisionTransformer(
         patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, 
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 
 
-def ba_vit_large_patch16(**kwargs):
-    model = AttenOnAttenVisionTransformer(
+def vit_large_patch16(**kwargs):
+    model = AttenBatchVisionTransformer(
         patch_size=16, embed_dim=1024, depth=24, num_heads=16, mlp_ratio=4, 
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 
 
-def ba_vit_huge_patch14(**kwargs):
-    model = AttenOnAttenVisionTransformer(
+def vit_huge_patch14(**kwargs):
+    model = AttenBatchVisionTransformer(
         patch_size=14, embed_dim=1280, depth=32, num_heads=16, mlp_ratio=4,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
