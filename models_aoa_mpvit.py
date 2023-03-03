@@ -679,10 +679,8 @@ class MPViT(nn.Module):
 
         for idx in range(self.num_stages):
             att_inputs = self.patch_embed_stages[idx](x)
-            for att_input in att_inputs:
-                print(att_input.size())
             x = self.mhca_stages[idx](att_inputs)
-            print('out:', x.size())
+
         return x
 
     def forward(self, x):

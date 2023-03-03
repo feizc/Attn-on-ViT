@@ -1,12 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F 
-from typing import Tuple, Callable, Optional, Dict, Any 
+from typing import Tuple
 import itertools
 from copy import deepcopy
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from timm.models import build_model_with_cfg
+from timm.models.helpers import  build_model_with_cfg
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_, lecun_normal_
 from timm.models.registry import register_model
 from timm.models.vision_transformer import checkpoint_filter_fn
@@ -566,7 +566,7 @@ def _create_transformer(
 
     model = build_model_with_cfg(
         DaViT, variant, pretrained,
-        default_cfg=default_cfg,
+        pretrained_cfg=default_cfg,
         img_size=img_size,
         num_classes=num_classes,
         pretrained_filter_fn=checkpoint_filter_fn,

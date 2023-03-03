@@ -11,96 +11,309 @@
 
 from functools import partial
 import math 
+import torch.nn.functional as F
 import torch
-import torch.nn as nn
-import numpy as np 
-
+import torch.nn as nn 
+from torch import nn, einsum
+from torch.fft import rfft, irfft 
+from einops import rearrange
+from scipy.fftpack import next_fast_len
 from timm.models.vision_transformer import PatchEmbed, DropPath, Mlp, trunc_normal_, _load_weights, \
                                             named_apply
                                             
 
+def exists(val):
+    return val is not None
 
-class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
+def identity(t, *args, **kwargs):
+    return t
+
+def default(val, d):
+    return val if exists(val) else d
+
+def append_dims(x, num_dims):
+    if num_dims <= 0:
+        return x
+    return x.view(*x.shape, *((1,) * num_dims))
+
+def conv1d_fft(x, weights, dim = -2, weight_dim = -1):
+    # O(N log(N)) 1d convolution using some fourier trick
+
+    assert weight_dim >= dim
+
+    N = x.shape[dim]
+    M = weights.shape[weight_dim]
+
+    fast_len = next_fast_len(N + M - 1)
+
+    f_x = rfft(x, n = fast_len, dim = dim)
+    f_weight = rfft(weights, n = fast_len, dim = weight_dim)
+
+    f_v_weight = f_x * append_dims(f_weight.conj(), weight_dim - dim)
+    out = irfft(f_v_weight, fast_len, dim = dim)
+    out = out.roll(-1, dims = (dim,))
+
+    indices = torch.arange(start = fast_len - N, end = fast_len, dtype = torch.long, device = x.device)
+    out = out.index_select(dim, indices)
+    return out
+
+
+class LaplacianAttnFn(nn.Module):
+    def forward(self, x):
+        mu = math.sqrt(0.5)
+        std = math.sqrt((4 * math.pi) ** -1)
+        return (1 + torch.special.erf((x - mu) / (std * math.sqrt(2)))) * 0.5
+
+
+class OffsetScale(nn.Module):
+    def __init__(self, dim, heads = 1):
         super().__init__()
-        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
-
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
+        self.gamma = nn.Parameter(torch.ones(heads, dim))
+        self.beta = nn.Parameter(torch.zeros(heads, dim))
+        nn.init.normal_(self.gamma, std = 0.02)
 
     def forward(self, x):
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)   # make torchscript happy (cannot use tensor as tuple)
-
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
+        out = einsum('... d, h d -> ... h d', x, self.gamma) + self.beta
+        return out.unbind(dim = -2)
 
 
-class BatchMemoryAttention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., alpha=0.01):
+
+class T5RelativePositionBias(nn.Module):
+    def __init__(
+        self,
+        scale,
+        causal = False,
+        num_buckets = 32,
+        max_distance = 128
+    ):
         super().__init__()
-        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
+        self.scale = scale
+        self.causal = causal
+        self.num_buckets = num_buckets
+        self.max_distance = max_distance
+        self.relative_attention_bias = nn.Embedding(num_buckets, 1)
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop) 
+    @staticmethod
+    def _relative_position_bucket(
+        relative_position,
+        causal = True,
+        num_buckets = 32,
+        max_distance = 128
+    ):
+        ret = 0
+        n = -relative_position
+        if not causal:
+            num_buckets //= 2
+            ret += (n < 0).long() * num_buckets
+            n = torch.abs(n)
+        else:
+            n = torch.max(n, torch.zeros_like(n))
 
-        #self.batch_memory_proj_k = nn.Linear(dim // num_heads, dim // num_heads) 
-        #self.batch_memory_proj_v = nn.Linear(dim // num_heads, dim // num_heads) 
-        self.mean_key = torch.zeros((num_heads, 197, dim // num_heads)) 
-        self.mean_value = torch.zeros((num_heads, 197, dim // num_heads)) 
-        self.alpha = alpha 
+        max_exact = num_buckets // 2
+        is_small = n < max_exact
 
-        self.scale = nn.Parameter(torch.ones([])*0.3)
+        val_if_large = max_exact + (
+            torch.log(n.float() / max_exact) / math.log(max_distance / max_exact) * (num_buckets - max_exact)
+        ).long()
+        val_if_large = torch.min(val_if_large, torch.full_like(val_if_large, num_buckets - 1))
+
+        ret += torch.where(is_small, n, val_if_large)
+        return ret
+
+    def forward(self, x):
+        i, j, device = *x.shape[-2:], x.device
+        q_pos = torch.arange(i, dtype = torch.long, device = device)
+        k_pos = torch.arange(j, dtype = torch.long, device = device)
+        rel_pos = rearrange(k_pos, 'j -> 1 j') - rearrange(q_pos, 'i -> i 1')
+        rp_bucket = self._relative_position_bucket(rel_pos, causal = self.causal, num_buckets = self.num_buckets, max_distance = self.max_distance)
+        values = self.relative_attention_bias(rp_bucket)
+        bias = rearrange(values, 'i j 1 -> i j')
+        return bias * self.scale
 
 
-    def forward(self, x, mode=0):
-        """
-            mode: 0 for training, 1 for infer 
-        """
+class SingleHeadedAttention(nn.Module):
+    def __init__(
+        self,
+        *,
+        dim,
+        dim_qk,
+        dim_value,
+        causal = False,
+        laplacian_attn_fn = False
+    ):
+        super().__init__()
+        self.causal = causal
+        self.laplacian_attn_fn = laplacian_attn_fn
 
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)   # make torchscript happy (cannot use tensor as tuple)
-        
-        delta_k = self.mean_key.detach()
-        delta_v = self.mean_value.detach() 
+        self.attn_fn = partial(F.softmax, dim = -1) if not laplacian_attn_fn else LaplacianAttnFn()
 
-        # update moving average 
-        if mode == 0:
-            self.mean_key = self.alpha * torch.mean(k, dim=0) + (1 - self.alpha) * self.mean_key.to(x.device) 
-            self.mean_value = self.alpha * torch.mean(v, dim=0) + (1 - self.alpha) * self.mean_value.to(x.device)
+        self.rel_pos_bias = T5RelativePositionBias(causal = causal, scale = dim_qk ** 0.5)
 
-        # delta_k = self.batch_memory_proj_k(delta_k) 
-        # delta_v = self.batch_memory_proj_v(delta_v) 
+        self.to_qk = nn.Sequential(
+            nn.Linear(dim, dim_qk),
+            nn.SiLU()
+        )
 
-        k = k + self.scale * delta_k.to(x.device)
-        v = v + self.scale * delta_v.to(x.device)
+        self.offsetscale = OffsetScale(dim_qk, heads = 2)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
+        self.to_v = nn.Sequential(
+            nn.Linear(dim, dim_value),
+            nn.SiLU()
+        )
 
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
+    def forward(self, x, v_input = None):
+        seq_len, dim, device, dtype = *x.shape[-2:], x.device, x.dtype
+
+        v_input = default(v_input, x)
+
+        qk, v = self.to_qk(x), self.to_v(v_input)
+        q, k = self.offsetscale(qk)
+
+        scale = (seq_len ** -1) if self.laplacian_attn_fn else (dim ** -0.5)
+
+        sim = einsum('b i d, b j d -> b i j', q, k) * scale
+
+        sim = sim + self.rel_pos_bias(sim)
+
+        if self.causal:
+            causal_mask = torch.ones((seq_len, seq_len), device = device, dtype = torch.bool).triu(1)
+
+        if self.causal and not self.laplacian_attn_fn:
+            # is softmax attention and using large negative value pre-softmax
+            sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
+
+        attn = self.attn_fn(sim)
+
+        if self.causal and self.laplacian_attn_fn:
+            # if using laplacian attention function, zero out upper triangular with 0s
+            attn = attn.masked_fill(causal_mask, 0.)
+
+        return einsum('b i j, b j d -> b i d', attn, v)
+
+
+
+class MultiHeadedEMA(nn.Module):
+    def __init__(
+        self,
+        *,
+        dim,
+        heads,
+        bidirectional = True,
+        dim_head = None
+    ):
+        super().__init__()
+        self.bidirectional = bidirectional
+
+        self.expansion = nn.Parameter(torch.randn(heads * (2 if bidirectional else 1), dim))
+        self.reduction = nn.Parameter(torch.randn(heads * (2 if bidirectional else 1), dim))
+
+        # learned alpha and dampening factors
+
+        self.alphas = nn.Parameter(torch.randn(heads))
+        self.dampen_factors = nn.Parameter(torch.randn(heads))
+
+        if bidirectional:
+            self.reverse_alphas = nn.Parameter(torch.randn(heads))
+            self.reverse_dampen_factors = nn.Parameter(torch.randn(heads))
+
+    def forward(self, x):
+        device, seq_len = x.device, x.shape[1]
+
+        # project in and split heads
+
+        x = einsum('... d, h d -> ... h d', x, self.expansion)
+
+        if self.bidirectional:
+            x, x_reversed = x.chunk(2, dim = -2)
+            x_reversed = torch.flip(x_reversed, dims = (1,))
+
+        # weights derived from alphas (learned exponential smoothing decay rate)
+
+        def apply_learned_ema_with_damping(x, alphas, dampen_factors):
+            alphas = alphas.sigmoid()
+            dampen_factors = dampen_factors.sigmoid()
+
+            reversed_powers = torch.arange(seq_len - 1, -1, -1, device = device)
+            K = alphas * (((1 - alphas) * dampen_factors) ** rearrange(reversed_powers, '... l -> ... l 1'))
+
+            # conv1d fft O(nlog(n))
+
+            return conv1d_fft(x, K, dim = -3, weight_dim = -2)
+
+        x = apply_learned_ema_with_damping(x, self.alphas, self.dampen_factors)
+
+        if self.bidirectional:
+            x_reversed = apply_learned_ema_with_damping(x_reversed, self.reverse_alphas, self.reverse_dampen_factors)
+            x_reversed = torch.flip(x_reversed, dims = (1,))
+            x = torch.cat((x, x_reversed), dim = -2)
+
+        # combine heads and out
+
+        return einsum('... h d, h d -> ... d', x, self.reduction)
+
+class MegaLayer(nn.Module):
+    def __init__(
+        self,
+        dim = 128,
+        num_heads = 16,
+        attn_dim_qk = 64,
+        attn_dim_value = 256,
+        qkv_bias = False, 
+        laplacian_attn_fn = False,
+        causal = False,
+        ema_dim_head = None
+    ):
+        super().__init__()
+        ema_heads = num_heads
+        self.single_headed_attn = SingleHeadedAttention(
+            dim = dim,
+            dim_qk = attn_dim_qk,
+            dim_value = attn_dim_value,
+            causal = causal,
+            laplacian_attn_fn = laplacian_attn_fn
+        )
+
+        self.multi_headed_ema = MultiHeadedEMA(
+            dim = dim,
+            heads = ema_heads,
+            bidirectional = not causal,
+            dim_head = ema_dim_head
+        )
+
+        self.to_reset_gate = nn.Sequential(
+            nn.Linear(dim, attn_dim_value),
+            nn.SiLU()
+        )
+
+        self.to_update_gate = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.Sigmoid()
+        )
+
+        # equation 14, for calculating H
+
+        self.Wh = nn.Parameter(torch.randn(dim, dim))
+        self.Uh = nn.Parameter(torch.randn(attn_dim_value, dim))
+        self.bh = nn.Parameter(torch.randn(dim))
+
+    def forward(self, x, residual = None):
+        residual = default(residual, x)
+
+        ema_output = self.multi_headed_ema(x)
+        attn_output = self.single_headed_attn(ema_output, x)
+
+        reset_gate = self.to_reset_gate(ema_output)
+        update_gate = self.to_update_gate(ema_output)
+
+        gated_attn_output = attn_output * reset_gate
+
+        # equation 14
+
+        H = F.silu(ema_output @ self.Wh + gated_attn_output @ self.Uh + self.bh)
+
+        # update gate
+
+        return update_gate * H + (1 - update_gate) * residual
 
 
 class LayerScale(nn.Module):
@@ -130,7 +343,7 @@ class Block(nn.Module):
     ):
         super().__init__()
         self.norm1 = norm_layer(dim)
-        self.attn = BatchMemoryAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
+        self.attn = MegaLayer(dim, num_heads=num_heads, qkv_bias=qkv_bias, )
         self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
@@ -140,13 +353,13 @@ class Block(nn.Module):
         self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-    def forward(self, x, mode=0):
-        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x), mode)))
+    def forward(self, x):
+        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
         x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
-        return x, mode
+        return x
 
 
-class AttenBatchVisionTransformer(nn.Module):
+class EMAVisionTransformer(nn.Module):
     """ Vision Transformer
     A PyTorch impl of : `An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale`
         - https://arxiv.org/abs/2010.11929
@@ -310,14 +523,12 @@ class AttenBatchVisionTransformer(nn.Module):
             x = x + self.pos_embed
         return self.pos_drop(x)
 
-    def forward_features(self, x, mode):
+    def forward_features(self, x):
         x = self.patch_embed(x)
         x = self._pos_embed(x)
         x = self.norm_pre(x)
-        for block in self.blocks: 
-            x, _ = block(x, mode)
-        # x, _ = self.blocks(x=x, mode=mode)
         
+        x = self.blocks(x)
         x = self.norm(x)
         return x
 
@@ -327,8 +538,8 @@ class AttenBatchVisionTransformer(nn.Module):
         x = self.fc_norm(x)
         return x if pre_logits else self.head(x)
 
-    def forward(self, x, mode=0):
-        x = self.forward_features(x, mode)
+    def forward(self, x):
+        x = self.forward_features(x)
         x = self.forward_head(x)
         return x
 
@@ -344,21 +555,21 @@ def init_weights_vit_timm(module: nn.Module, name: str = ''):
 
 
 def vit_base_patch16(**kwargs):
-    model = AttenBatchVisionTransformer(
+    model = EMAVisionTransformer(
         patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, 
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 
 
 def vit_large_patch16(**kwargs):
-    model = AttenBatchVisionTransformer(
+    model = EMAVisionTransformer(
         patch_size=16, embed_dim=1024, depth=24, num_heads=16, mlp_ratio=4, 
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 
 
 def vit_huge_patch14(**kwargs):
-    model = AttenBatchVisionTransformer(
+    model = EMAVisionTransformer(
         patch_size=14, embed_dim=1280, depth=32, num_heads=16, mlp_ratio=4,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
